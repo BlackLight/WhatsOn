@@ -1,0 +1,332 @@
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+import random
+import subprocess
+import time, datetime
+import logging
+import sqlite3
+import xmpp
+from threading import Thread
+from getopt import getopt
+from Yowsup.connectionmanager import YowsupConnectionManager
+from Yowsup.Tools.debugger import Debugger
+from Yowsup.Tools.utilities import Utilities
+
+# Requirements:
+# Yowsup - https://github.com/tgalal/yowsup
+# Python SQLite
+# Python XMPP
+
+##### XMPP CLASS #####
+class XMPP(Thread):
+	def __init__(self, username, password, forwardTo):
+		Thread.__init__(self)
+		self.username = username
+		self.password = password
+		self.forwardTo = forwardTo
+		self.domain = re.sub('^[^@]+@', '', username)
+		self.client = xmpp.Client(self.domain, debug=[])
+		self.connect()
+
+	def setWhatsAppClient(self, wa):
+		self.wa = wa
+
+	def connect(self):
+		logging.info("Connecting to %s" % self.domain)
+		self.client.connect()
+		logging.info("Connected to %s, logging in as %s" % (self.domain, self.username))
+		self.client.auth(self.username, self.password)
+		logging.info("Logged in as %s" % self.username)
+		self.client.RegisterHandler('message', self.onMessage)
+		self.client.sendInitPresence()
+
+	def sendMessage(self, to, message):
+		self.client.send(xmpp.protocol.Message(to, message))
+
+	def forwardMessage(self, message):
+		self.sendMessage(self.forwardTo, message)
+
+	def onMessage(self, message):
+		logging.info("Message received")
+##########
+
+##### DB CLASS #####
+class Db:
+	def __init__(self):
+		self.dbpath = os.environ['HOME'] + "/.whatsapp/whatsapp.db"
+		self.createTables = ["""
+CREATE TABLE IF NOT EXISTS users(
+	phone varchar(128) primary key,
+	imei varchar(128) unique not null,
+	nick varchar(255) unique not null,
+	lastlogin datetime)""", """
+CREATE TABLE IF NOT EXISTS contacts(
+	phone varchar(128) primary key,
+	nick varchar(255) unique not null,
+	lastseen datetime)""","""
+CREATE TABLE IF NOT EXISTS messages(
+	id varchar(255) primary key,
+	src varchar(128),
+	dest varchar(128),
+	body text,
+	time datetime,
+	foreign key(src) references contacts(phone),
+	foreign key(dest) references contacts(phone))""","""
+CREATE TABLE IF NOT EXISTS receipts(
+	id varchar(255) primary key,
+	src varchar(128),
+	time datetime,
+	foreign key(src) references messages(dest),
+	foreign key(id) references messages(id))"""]
+
+		self.db = sqlite3.connect(self.dbpath)
+		self.cursor = self.db.cursor()
+		for createTable in self.createTables:
+			self.cursor.execute(createTable)
+			self.db.commit()
+
+	def storeMessage(self, messageId, src, dest, body):
+		if messageId is None:
+			random.seed()
+			messageId = str(int(time.time())) + "-" + str(random.randint(1, 9999))
+			self.cursor.execute("INSERT INTO messages(id, src, dest, body, time) " \
+				"VALUES(?, ?, ?, ?, DATETIME('now', 'localtime'))",
+				[messageId, src, dest, body])
+		else:
+			self.cursor.execute("INSERT INTO messages(id, src, dest, body, time) " \
+				"VALUES(?, ?, ?, ?, DATETIME('now', 'localtime'))",
+				[messageId, src, dest, body])
+		self.db.commit()
+		self.close()
+
+	def storeReceipt(self, messageId, number):
+		self.cursor.execute("INSERT INTO receipts(id, src, time) " \
+			"VALUES(?, ?, DATETIME('now', 'localtime'))",
+			[messageId, number])
+		self.db.commit()
+		self.close()
+
+	def getNickFromNumber(self, number):
+		res = self.cursor.execute("SELECT nick FROM contacts WHERE phone=?", [number]).fetchone()
+		self.close()
+		return res[0] if res else None
+
+	def insertContact(self, number, nick):
+		self.cursor.execute("INSERT INTO contacts(phone, nick) VALUES(?, ?)",
+			[number, nick])
+		self.close()
+
+	def close(self):
+		self.db.commit()
+		self.cursor.close()
+		self.db.close()
+##########
+
+##### WHATSAPP CLIENT CLASS #####
+class WhatsappClient:
+	def __init__(self, phoneNumber, imei, keepAlive = True, sendReceipts = True):
+		self.sendReceipts = sendReceipts
+		self.phoneNumber = phoneNumber
+		self.jid = "%s@s.whatsapp.net" % phoneNumber
+		self.imei = imei
+		self.password = Utilities.getPassword(imei)
+		self.to = None
+		self.contacts = {}
+		
+		connectionManager = YowsupConnectionManager()
+		connectionManager.setAutoPong(keepAlive)
+
+		self.signalsInterface = connectionManager.getSignalsInterface()
+		self.methodsInterface = connectionManager.getMethodsInterface()
+		
+		self.signalsInterface.registerListener("message_received", self.onMessageReceived)
+		self.signalsInterface.registerListener("auth_success", self.onAuthSuccess)
+		self.signalsInterface.registerListener("auth_fail", self.onAuthFailed)
+		self.signalsInterface.registerListener("disconnected", self.onDisconnected)
+		self.signalsInterface.registerListener("receipt_messageSent", self.onMessageSent)
+		self.signalsInterface.registerListener("contact_typing", self.onContactTyping)
+		self.signalsInterface.registerListener("contact_paused", self.onContactPaused)
+		
+		self.cm = connectionManager
+		self.make_fifo()
+
+	def setXMPPClient(self, jabber):
+		self.jabber = jabber
+
+	def login(self):
+		self.methodsInterface.call("auth_login", (self.phoneNumber, self.password))
+		f = open(self.fifo_path, 'r')
+		
+		while True:
+			try:
+				line = f.readline()
+			except EOFError:
+				continue
+
+			m = re.match('^\s*To:\s*\+?([0-9]+).*$', line)
+			if m:
+				if self.to is None:
+					self.to = {}
+				self.to['number'] = m.group(1)
+				self.to['jid'] = "%s@s.whatsapp.net" % m.group(1)
+				self.to['nick'] = self.getNickFromNumber(m.group(1))
+				logging.info("Sending next message to: %s (%s)" % (self.to['number'], self.to['nick']))
+			else:
+				if self.to is None:
+					logging.warning("Warning: Protocol error: No \"To:\" recipient header specified")
+					continue
+
+				line = line.strip()
+				if len(line) > 0:
+					self.methodsInterface.call("message_send", (self.to['jid'], line))
+					Db().storeMessage(None, self.phoneNumber, self.to['number'], line)
+					logging.info("Message sent to %s (%s): %s" % (self.to['number'], self.to['nick'], line))
+			time.sleep(0.1)
+
+	def onAuthSuccess(self, username):
+		logging.info("Authenticated as %s" % username)
+		self.methodsInterface.call("ready")
+
+	def onAuthFailed(self, username, err):
+		logging.error("Authentication as %s: Failed: %s" % (username, err))
+
+	def onDisconnected(self, reason):
+		logging.error("Disconnected: Reason: %s" % reason)
+
+	def onMessageReceived(self, messageId, jid, messageContent, timestamp, wantsReceipt, pushName):
+		number = re.sub('@.*$', '', jid)
+		nick = self.getNickFromNumber(number)
+		formattedDate = datetime.datetime.fromtimestamp(timestamp).strftime('%d-%m-%Y %H:%M:%S')
+		logging.info("Message from %s (%s): %s" % (number, nick, messageContent))
+		Db().storeMessage(messageId, number, self.phoneNumber, messageContent)
+
+		if self.sendReceipts:
+			self.methodsInterface.call("message_ack", (jid, messageId))
+
+		if self.jabber is not None:
+			self.jabber.forwardMessage("Message from %s (%s): %s" % (nick, number, messageContent))
+
+	def onMessageSent(self, jid, messageId):
+		number = re.sub('@.*$', '', jid)
+		nick = self.getNickFromNumber(number)
+		Db().storeReceipt(messageId, number)
+		logging.info("%s (%s) received the message" % (number, nick))
+		self.jabber.forwardMessage("%s (%s) received the message" % (number, nick))
+
+	def onContactTyping(self, jid):
+		number = re.sub('@.*$', '', jid)
+		logging.info("%s is typing" % (number))
+
+	def onContactPaused(self, jid):
+		number = re.sub('@.*$', '', jid)
+		logging.info("%s stopped typing" % (number))
+
+	def make_fifo(self):
+		self.fifo_path = os.environ['HOME'] + '/.whatsapp'
+		if not os.path.isdir(self.fifo_path):
+			os.mkdir(self.fifo_path)
+
+		self.fifo_path = "%s/whatsapp.fifo" % self.fifo_path
+		try:
+			os.remove(self.fifo_path)
+		except:
+			pass
+		os.mkfifo(self.fifo_path)
+
+	def getNickFromNumber(self, number):
+		# First check if the number is in our local cache
+		if number in self.contacts:
+			return self.contacts[number]
+
+		# If it is not there, attempt to fetch it from the SQLite database
+		res = Db().getNickFromNumber(number)
+		if res is not None:
+			return res
+
+		# If it not there, search for it in the contacts text file
+		contactsPath = os.environ['HOME'] + "/.phonebook"
+		if not os.path.exists(contactsPath):
+			return ""
+
+		f = open(contactsPath, 'r')
+		contacts = f.readlines()
+		f.close()
+
+		for contact in contacts:
+			m = re.match('^\s*export ([^=]+)="?\+?%s"?\s*$' % number, contact)
+			if m:
+				nick = re.sub('_', ' ', m.group(1))
+				Db().insertContact(number, nick)
+				self.contacts[number] = nick
+				return nick
+		return ""
+##########
+
+def getConfig():
+	config = {}
+	optlist, args = getopt(sys.argv[1:], 'n:i:u:p:f:')
+
+	for opt, arg in optlist:
+		if opt == '-n':
+			config['number'] = arg
+		elif opt == '-i':
+			config['imei'] = arg
+		elif opt == '-u':
+			config['user'] = arg
+		elif opt == '-p':
+			config['password'] = arg
+		elif opt == '-f':
+			config['forward'] = arg
+
+	return config
+
+def usage():
+	print """
+WhatsOn - WhatsApp wrapper in Python
+Usage: python %s <-n [phone number]> <-i [phone imei]> <-u [jabber username]> <-p [jabber password]> <-f [jabber forwardTo contact]>
+	-n 	The phone number associated to your WhatsApp account, country code included, without leading + or 0, i.e. 393471234567
+	-i 	The IMEI of your mobile, for Nokia/Android/Blackberry devices, or the MAC address, for iPhone
+	-u 	The Jabber/GTalk/XMPP username that will forward the requests to your primary Jabber/GTalk/XMPP, you can get one easily at jabber.org
+	-p 	The password for your Jabber/GTalk/XMPP account
+	-f 	Your personal Jabber/GTalk/XMPP account, that is the one you want the received WhatsApp messages to be forwarded
+
+How it works?
+
+	1. 	Once started with all the options, a fifo named ~/.whatsapp/whatsapp.fifo will be created
+	2. 	All the received messages on your WhatsApp account will be forwarded by your Jabber bot (see -u option) to the Jabber account you specified (see -f option).
+		That is usually your personal account. The receipts of the received messages and the typing notices will be forwarded as well
+	3. 	All the activity will be logged to ~/.whatsapp/whatsapp.log
+	4. 	If you want to send a message to a contact, just write recipient and message to the fifo pipe. Example:
+
+		$ echo "To: 393471234567" > ~/.whatsapp/whatsapp.fifo
+		$ echo "Hey dude, how you doing?" > ~/.whatsapp/whatsapp.fifo
+		$ echo "What about tonight?" > ~/.whatsapp/whatsapp.fifo
+
+	5. 	The received and sent messages, receipts and contacts will be also saved to the SQLite database ~/.whatsapp/whatsapp.db
+""" % sys.argv[0]
+
+##### MAIN #####
+if __name__ == "__main__":
+	Debugger.enabled = False
+
+	config = getConfig()
+	if not 'number' in config or not 'imei' in config or not 'user' in config or not 'password' in config or not 'forward' in config:
+		usage()
+		sys.exit(1)
+
+	logging.basicConfig(filename=os.environ['HOME'] + "/.whatsapp/whatsapp.log",
+		format='%(asctime)s | %(levelname)7s | %(message)s',
+		level=logging.DEBUG)
+
+	chat = XMPP(config['user'], config['password'], config['forward'])
+	wa = WhatsappClient(config['number'], config['imei'])
+
+	chat.setWhatsAppClient(wa)
+	wa.setXMPPClient(chat)
+
+	chat.run()
+	wa.login()
+
